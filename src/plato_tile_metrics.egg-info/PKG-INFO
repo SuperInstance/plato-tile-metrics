@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: plato-tile-metrics
+Version: 0.1.0
+Summary: Fleet tile analytics — domain distribution, confidence, growth rate
+License: MIT
+Requires-Python: >=3.8
