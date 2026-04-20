@@ -1,135 +1,184 @@
-"""Tile metrics — counters, gauges, histograms, percentiles, time windows."""
+"""Tile metrics — aggregation, histograms, percentiles, anomaly detection, windowed stats."""
 import time
 import math
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Optional
-from collections import defaultdict
+from typing import Optional, Callable
+from enum import Enum
+
+class MetricType(Enum):
+    COUNTER = "counter"
+    GAUGE = "gauge"
+    HISTOGRAM = "histogram"
+    SUMMARY = "summary"
 
 @dataclass
-class Metric:
+class MetricPoint:
     name: str
-    value: float = 0.0
+    value: float
     timestamp: float = field(default_factory=time.time)
     tags: dict = field(default_factory=dict)
+    metric_type: MetricType = MetricType.GAUGE
 
 @dataclass
 class HistogramBucket:
-    le: float  # less-than-or-equal
+    le: float   # less-than-or-equal boundary
     count: int = 0
+
+@dataclass
+class MetricSnapshot:
+    name: str
+    count: int = 0
+    sum_val: float = 0.0
+    min_val: float = float('inf')
+    max_val: float = float('-inf')
+    avg_val: float = 0.0
+    p50: float = 0.0
+    p90: float = 0.0
+    p95: float = 0.0
+    p99: float = 0.0
+    std_dev: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+
+@dataclass
+class AnomalyEvent:
+    metric: str
+    value: float
+    expected_min: float
+    expected_max: float
+    severity: str
+    timestamp: float = field(default_factory=time.time)
 
 class TileMetrics:
     def __init__(self, retention: int = 10000):
         self._counters: dict[str, float] = defaultdict(float)
         self._gauges: dict[str, float] = {}
         self._histograms: dict[str, list[float]] = defaultdict(list)
-        self._time_series: dict[str, list[Metric]] = defaultdict(list)
-        self.retention = retention
+        self._timeline: deque = deque(maxlen=retention)
+        self._windows: dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+        self._anomalies: list[AnomalyEvent] = []
+        self._baselines: dict[str, dict] = {}
 
-    # Counters
-    def increment(self, name: str, amount: float = 1.0, tags: dict = None) -> float:
-        self._counters[name] += amount
-        return self._counters[name]
+    def counter(self, name: str, value: float = 1.0, tags: dict = None):
+        key = self._key(name, tags)
+        self._counters[key] += value
+        self._timeline.append(MetricPoint(name, value, tags=tags or {}, metric_type=MetricType.COUNTER))
 
-    def decrement(self, name: str, amount: float = 1.0) -> float:
-        return self.increment(name, -amount)
+    def gauge(self, name: str, value: float, tags: dict = None):
+        key = self._key(name, tags)
+        self._gauges[key] = value
+        self._timeline.append(MetricPoint(name, value, tags=tags or {}, metric_type=MetricType.GAUGE))
+        self._check_anomaly(name, value)
 
-    def get_counter(self, name: str) -> float:
-        return self._counters[name]
+    def histogram(self, name: str, value: float, tags: dict = None):
+        key = self._key(name, tags)
+        self._histograms[key].append(value)
+        self._timeline.append(MetricPoint(name, value, tags=tags or {}, metric_type=MetricType.HISTOGRAM))
 
-    def reset_counter(self, name: str):
-        self._counters[name] = 0.0
+    def timing(self, name: str, start_time: float, tags: dict = None):
+        elapsed = (time.time() - start_time) * 1000  # ms
+        self.histogram(name, elapsed, tags)
 
-    # Gauges
-    def set_gauge(self, name: str, value: float, tags: dict = None):
-        self._gauges[name] = value
-        m = Metric(name=name, value=value, tags=tags or {})
-        self._append_series(name, m)
+    def get_counter(self, name: str, tags: dict = None) -> float:
+        return self._counters.get(self._key(name, tags), 0.0)
 
-    def get_gauge(self, name: str) -> float:
-        return self._gauges.get(name, 0.0)
+    def get_gauge(self, name: str, tags: dict = None) -> Optional[float]:
+        return self._gauges.get(self._key(name, tags))
 
-    # Histograms
-    def record(self, name: str, value: float):
-        hist = self._histograms[name]
-        hist.append(value)
-        if len(hist) > self.retention:
-            self._histograms[name] = hist[-self.retention:]
-
-    def histogram_stats(self, name: str) -> dict:
-        values = self._histograms.get(name, [])
+    def get_histogram_stats(self, name: str, tags: dict = None) -> MetricSnapshot:
+        key = self._key(name, tags)
+        values = self._histograms.get(key, [])
         if not values:
-            return {"count": 0, "min": 0, "max": 0, "mean": 0, "p50": 0, "p95": 0, "p99": 0, "stddev": 0}
-        n = len(values)
-        values_sorted = sorted(values)
-        mean = sum(values) / n
-        variance = sum((v - mean) ** 2 for v in values) / n
-        stddev = math.sqrt(variance)
-        return {"count": n, "min": values_sorted[0], "max": values_sorted[-1],
-                "mean": round(mean, 4),
-                "p50": round(values_sorted[int(n * 0.50)], 4),
-                "p90": round(values_sorted[int(n * 0.90)], 4),
-                "p95": round(values_sorted[int(n * 0.95)], 4),
-                "p99": round(values_sorted[min(int(n * 0.99), n - 1)], 4),
-                "stddev": round(stddev, 4)}
+            return MetricSnapshot(name=name)
+        sorted_vals = sorted(values)
+        n = len(sorted_vals)
+        mean = sum(sorted_vals) / n
+        variance = sum((v - mean) ** 2 for v in sorted_vals) / n if n > 0 else 0
+        return MetricSnapshot(
+            name=name, count=n, sum_val=sum(sorted_vals),
+            min_val=sorted_vals[0], max_val=sorted_vals[-1], avg_val=mean,
+            p50=self._percentile(sorted_vals, 0.50),
+            p90=self._percentile(sorted_vals, 0.90),
+            p95=self._percentile(sorted_vals, 0.95),
+            p99=self._percentile(sorted_vals, 0.99),
+            std_dev=math.sqrt(variance)
+        )
 
-    def percentile(self, name: str, p: float) -> float:
-        values = sorted(self._histograms.get(name, []))
-        if not values:
+    def window(self, name: str, duration: float = 60.0) -> list[MetricPoint]:
+        cutoff = time.time() - duration
+        return [p for p in self._timeline if p.name == name and p.timestamp >= cutoff]
+
+    def window_aggregate(self, name: str, duration: float = 60.0) -> dict:
+        points = self.window(name, duration)
+        if not points:
+            return {"count": 0, "sum": 0, "avg": 0, "min": 0, "max": 0}
+        values = [p.value for p in points]
+        return {"count": len(values), "sum": sum(values), "avg": sum(values)/len(values),
+                "min": min(values), "max": max(values)}
+
+    def rate(self, name: str, window_s: float = 60.0) -> float:
+        points = self.window(name, window_s)
+        if len(points) < 2:
             return 0.0
-        idx = min(int(len(values) * p), len(values) - 1)
-        return values[idx]
+        duration = points[-1].timestamp - points[0].timestamp
+        if duration <= 0:
+            return 0.0
+        return sum(p.value for p in points) / duration
 
-    # Time series
-    def _append_series(self, name: str, metric: Metric):
-        series = self._time_series[name]
-        series.append(metric)
-        if len(series) > self.retention:
-            self._time_series[name] = series[-self.retention:]
+    def set_baseline(self, name: str, mean: float, std: float, k: float = 3.0):
+        self._baselines[name] = {"mean": mean, "std": std, "k": k}
 
-    def record_ts(self, name: str, value: float, tags: dict = None):
-        m = Metric(name=name, value=value, tags=tags or {})
-        self._append_series(name, m)
+    def learn_baseline(self, name: str, window_s: float = 300.0):
+        points = self.window(name, window_s)
+        values = [p.value for p in points]
+        if len(values) < 10:
+            return
+        mean = sum(values) / len(values)
+        std = math.sqrt(sum((v - mean)**2 for v in values) / len(values))
+        self.set_baseline(name, mean, std)
 
-    def trend(self, name: str, window: float = 3600.0) -> dict:
-        """Trend analysis over a time window."""
-        series = self._time_series.get(name, [])
-        now = time.time()
-        recent = [m for m in series if now - m.timestamp < window]
-        if len(recent) < 2:
-            return {"direction": "insufficient_data", "samples": len(recent)}
-        values = [m.value for m in recent]
-        first_half = values[:len(values) // 2]
-        second_half = values[len(values) // 2:]
-        avg_first = sum(first_half) / len(first_half)
-        avg_second = sum(second_half) / len(second_half)
-        change = (avg_second - avg_first) / max(abs(avg_first), 0.001)
-        direction = "up" if change > 0.01 else ("down" if change < -0.01 else "stable")
-        return {"direction": direction, "change_pct": round(change * 100, 2),
-                "samples": len(recent), "window_s": window,
-                "avg_first": round(avg_first, 4), "avg_second": round(avg_second, 4)}
+    def _check_anomaly(self, name: str, value: float):
+        baseline = self._baselines.get(name)
+        if not baseline:
+            return
+        mean, std, k = baseline["mean"], baseline["std"], baseline["k"]
+        expected_min = mean - k * std
+        expected_max = mean + k * std
+        if value < expected_min or value > expected_max:
+            severity = "warning" if abs(value - mean) < 2 * k * std else "critical"
+            self._anomalies.append(AnomalyEvent(
+                metric=name, value=value, expected_min=expected_min,
+                expected_max=expected_max, severity=severity
+            ))
 
-    def aggregate(self, prefix: str = "") -> dict:
-        """Aggregate all metrics matching prefix."""
-        result = {}
-        for name, val in self._counters.items():
-            if not prefix or name.startswith(prefix):
-                result[f"counter:{name}"] = val
-        for name, val in self._gauges.items():
-            if not prefix or name.startswith(prefix):
-                result[f"gauge:{name}"] = val
-        for name in self._histograms:
-            if not prefix or name.startswith(prefix):
-                result[f"hist:{name}"] = self.histogram_stats(name)
-        return result
+    def anomalies(self, limit: int = 20) -> list[AnomalyEvent]:
+        return self._anomalies[-limit:]
 
-    def snapshot(self) -> dict:
-        return {"counters": dict(self._counters), "gauges": dict(self._gauges),
-                "histograms": {k: self.histogram_stats(k) for k in self._histograms},
-                "time_series": {k: len(v) for k, v in self._time_series.items()}}
+    def all_metrics(self) -> dict:
+        return {
+            "counters": dict(self._counters),
+            "gauges": dict(self._gauges),
+            "histograms": {k: len(v) for k, v in self._histograms.items()},
+            "baselines": self._baselines,
+            "anomaly_count": len(self._anomalies),
+        }
+
+    def _key(self, name: str, tags: dict = None) -> str:
+        if tags:
+            tag_str = ",".join(f"{k}={v}" for k, v in sorted(tags.items()))
+            return f"{name}|{tag_str}"
+        return name
+
+    @staticmethod
+    def _percentile(sorted_vals: list[float], p: float) -> float:
+        if not sorted_vals:
+            return 0.0
+        idx = int(len(sorted_vals) * p)
+        idx = min(idx, len(sorted_vals) - 1)
+        return sorted_vals[idx]
 
     @property
     def stats(self) -> dict:
         return {"counters": len(self._counters), "gauges": len(self._gauges),
-                "histograms": len(self._histograms),
-                "time_series": len(self._time_series),
-                "retention": self.retention}
+                "histograms": len(self._histograms), "timeline_points": len(self._timeline),
+                "baselines": len(self._baselines), "anomalies": len(self._anomalies)}
